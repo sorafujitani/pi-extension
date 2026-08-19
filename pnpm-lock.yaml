@@ -210,6 +210,9 @@ importers:
 
   .:
     devDependencies:
+      '@earendil-works/pi-ai':
+        specifier: ^0.84.2
+        version: 0.84.2(ws@8.21.3)
       '@earendil-works/pi-coding-agent':
         specifier: ^0.84.2
         version: 0.84.2(ws@8.21.3)
@@ -219,6 +222,9 @@ importers:
       '@types/node':
         specifier: ^24.0.0
         version: 24.13.3
+      typebox:
+        specifier: ^1.3.7
+        version: 1.3.7
       vite:
         specifier: npm:@voidzero-dev/vite-plus-core@0.2.7
         version: '@voidzero-dev/vite-plus-core@0.2.7(@types/node@24.13.3)(jiti@2.7.0)(yaml@2.9.0)'

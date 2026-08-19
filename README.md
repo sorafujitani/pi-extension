@@ -7,6 +7,25 @@ Personal extensions for the [pi](https://pi.dev) coding agent.
 - `atlantis-brain.js` — Atlantis context, metrics, and handoff integration
 - `input-panel.ts` — model, thinking, context, session, and working-directory panel
 - `session-usage.ts` — session token and turn usage summaries
+- `subagent/` — isolated subagents with parent-model-family routing
+
+### Subagent model routing
+
+The `subagent` tool keeps delegation inside the parent session's model family. Existing `model` values remain the default for parents in the same family. Add optional `modelRoutes` to an agent's frontmatter to choose a role-specific model for Claude or Grok parents:
+
+```yaml
+---
+name: planner
+description: Plan implementation
+model: openai-codex/gpt-5.6-sol
+modelRoutes:
+  claude: anthropic/claude-opus-5
+  grok: xai/grok-4.6
+thinking: high
+---
+```
+
+Routing keys can be model families (`gpt`, `claude`, `grok`) or exact Pi providers such as `anthropic`, `xai`, or `grok-cli`. Exact provider routes take precedence. When a parent belongs to another family and no route is configured, the subagent inherits the parent's exact model instead of crossing back to the configured GPT model. Explicit GPT models therefore continue to be used for GPT parent sessions.
 
 `herdr-agent-state.ts` is intentionally not included because herdr owns and regenerates that file.
 
