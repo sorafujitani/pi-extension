@@ -627,13 +627,6 @@ function formatTokens(value) {
   return `${Math.round(count)}`;
 }
 
-function formatBytes(value) {
-  const bytes = numeric(value);
-  if (bytes >= 1_000_000) return `${(bytes / 1_000_000).toFixed(1)}MB`;
-  if (bytes >= 1_000) return `${(bytes / 1_000).toFixed(1)}kB`;
-  return `${Math.round(bytes)}B`;
-}
-
 function formatSeconds(value) {
   const seconds = numeric(value) / 1_000;
   if (seconds < 60) return `${seconds.toFixed(1)}s`;
@@ -1586,6 +1579,7 @@ export function registerPiExtension(pi, options = {}) {
     restoreSessionState(state, ctx);
     ensureBrainAssignment(state, pi, ctx);
     activateGuard(state, pi, ctx);
+    ctx.ui?.setStatus?.("atlantis-turn-metrics", undefined);
     ctx.ui?.setWidget?.("atlantis-turn-metrics", undefined, {
       placement: "belowEditor",
     });
@@ -1641,15 +1635,6 @@ export function registerPiExtension(pi, options = {}) {
       }),
     );
     interaction.lastStopReason = event.message?.stopReason ?? "";
-    const cacheDenominator = usage.input + usage.cacheRead + usage.cacheWrite;
-    const cacheHit =
-      cacheDenominator > 0 ? `${((usage.cacheRead / cacheDenominator) * 100).toFixed(1)}%` : "n/a";
-    const deltaPrefix = contextDeltaTokens >= 0 ? "+" : "";
-    const turnMetrics = `context ${deltaPrefix}${formatTokens(contextDeltaTokens)} this turn · tool output ${formatBytes(toolOutputBytes)} · cache hit ${cacheHit}`;
-    ctx.ui?.setStatus?.("atlantis-turn-metrics", turnMetrics);
-    ctx.ui?.setWidget?.("atlantis-turn-metrics", [turnMetrics], {
-      placement: "belowEditor",
-    });
     state.currentTurn = undefined;
   });
 
