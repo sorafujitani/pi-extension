@@ -15,8 +15,8 @@
     "@earendil-works/pi-coding-agent": "^0.84.2",
     "@earendil-works/pi-tui": "^0.84.2",
     "@types/node": "^24.0.0",
-    "vite": "catalog:",
-    "vite-plus": "catalog:"
+    "vite": "npm:@voidzero-dev/vite-plus-core@0.2.7",
+    "vite-plus": "0.2.7"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
