@@ -3,9 +3,10 @@ import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-c
 import { CustomEditor } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import {
+  collectRecentUsage,
   collectSessionUsage,
-  formatSessionUsageCompact,
-  formatSessionUsageTotal,
+  formatUsageHeader,
+  formatUsageHeaderCompact,
 } from "./session-usage.js";
 
 type ThinkingColor =
@@ -57,24 +58,26 @@ function buildTopBorder(width: number, ctx: ExtensionContext, theme: Theme): str
   const thinkingColor = THINKING_COLORS[thinking] ?? "thinkingOff";
   const separator = theme.fg("borderMuted", "  ·  ");
   const sessionUsage = collectSessionUsage(ctx.sessionManager.getEntries());
+  const recentUsage = collectRecentUsage(ctx.sessionManager.getBranch());
   const prefixSegments = [
     theme.fg("accent", model),
     theme.fg(thinkingColor, `◐ ${thinking}`),
     theme.fg("text", contextLabel(ctx)),
   ];
   const cwdSegment = theme.fg("muted", `⌂ ${formatCwd(ctx.cwd)}`);
-  const buildContent = (sessionLabel: string): string =>
-    `─ ${[...prefixSegments, theme.fg("muted", sessionLabel), cwdSegment].join(separator)} `;
+  const buildContent = (usageLabel: string): string =>
+    `─ ${[...prefixSegments, theme.fg("muted", usageLabel), cwdSegment].join(separator)} `;
 
-  let content = buildContent(formatSessionUsageCompact(sessionUsage));
+  let content = buildContent(formatUsageHeader(sessionUsage, recentUsage));
   if (visibleWidth(content) > width) {
-    content = buildContent(formatSessionUsageTotal(sessionUsage));
+    content = buildContent(formatUsageHeaderCompact(sessionUsage, recentUsage));
   }
   content = truncateToWidth(content, width, "");
   return content + theme.fg("borderMuted", "─".repeat(Math.max(0, width - visibleWidth(content))));
 }
 
 type EditorConstructor = ConstructorParameters<typeof CustomEditor>;
+type EditorFactory = NonNullable<Parameters<ExtensionContext["ui"]["setEditorComponent"]>[0]>;
 
 class InputPanelEditor extends CustomEditor {
   constructor(
@@ -114,26 +117,37 @@ class InputPanelEditor extends CustomEditor {
 
 export default function (pi: ExtensionAPI) {
   let enabled = true;
+  let previousEditorFactory: EditorFactory | undefined;
+  let panelContext: ExtensionContext | undefined;
+  const panelFactory: EditorFactory = (tui, editorTheme, keybindings) =>
+    new InputPanelEditor(tui, editorTheme, keybindings, (width) => {
+      if (!panelContext) return "";
+      return buildTopBorder(width, panelContext, panelContext.ui.theme);
+    });
 
   function apply(ctx: ExtensionContext): void {
     if (ctx.mode !== "tui") return;
 
+    const currentEditorFactory = ctx.ui.getEditorComponent();
     if (!enabled) {
-      ctx.ui.setEditorComponent(undefined);
-      ctx.ui.setFooter(undefined);
+      if (currentEditorFactory === panelFactory) {
+        ctx.ui.setEditorComponent(previousEditorFactory);
+      }
+      previousEditorFactory = undefined;
+      panelContext = undefined;
       return;
     }
 
-    ctx.ui.setEditorComponent(
-      (tui, editorTheme, keybindings) =>
-        new InputPanelEditor(tui, editorTheme, keybindings, (width) =>
-          buildTopBorder(width, ctx, ctx.ui.theme),
-        ),
-    );
-    ctx.ui.setFooter(() => ({
-      invalidate() {},
-      render: () => [],
-    }));
+    if (currentEditorFactory === panelFactory) {
+      panelContext = ctx;
+      return;
+    }
+    // Arbitrary custom editors cannot be safely composed without a delegation contract.
+    if (currentEditorFactory) return;
+
+    previousEditorFactory = currentEditorFactory;
+    panelContext = ctx;
+    ctx.ui.setEditorComponent(panelFactory);
   }
 
   pi.on("session_start", (_event, ctx) => apply(ctx));

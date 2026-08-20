@@ -12,10 +12,12 @@
  * Uses JSON mode to capture structured output from subagents.
  */
 
-import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
@@ -34,7 +36,8 @@ import { resolveAgentModel } from "./model-routing.js";
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
-const PER_TASK_OUTPUT_CAP = 50 * 1024;
+const ABORT_GRACE_PERIOD_MS = 5_000;
+export const MODEL_VISIBLE_OUTPUT_BUDGET = 12 * 1024;
 
 function formatTokens(count: number): string {
   if (count < 1000) return count.toString();
@@ -162,6 +165,7 @@ interface SingleResult {
   model?: string;
   stopReason?: string;
   errorMessage?: string;
+  signalCode?: NodeJS.Signals | null;
   step?: number;
 }
 
@@ -185,7 +189,12 @@ function getFinalOutput(messages: Message[]): string {
 }
 
 function isFailedResult(result: SingleResult): boolean {
-  return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+  return (
+    result.exitCode !== 0 ||
+    result.signalCode != null ||
+    result.stopReason === "error" ||
+    result.stopReason === "aborted"
+  );
 }
 
 function getResultOutput(result: SingleResult): string {
@@ -195,15 +204,188 @@ function getResultOutput(result: SingleResult): string {
   return getFinalOutput(result.messages) || "(no output)";
 }
 
-function truncateParallelOutput(output: string): string {
-  const byteLength = Buffer.byteLength(output, "utf8");
-  if (byteLength <= PER_TASK_OUTPUT_CAP) return output;
+function formatTruncationMarker(omittedCharacters: number, artifactPath?: string): string {
+  const preservation = artifactPath
+    ? `Full output preserved in temporary artifact: ${artifactPath}. Read it with the read tool.`
+    : "Full output preserved in tool details.";
+  return `\n\n[Output truncated: ${omittedCharacters} characters omitted. ${preservation}]`;
+}
 
-  let truncated = output.slice(0, PER_TASK_OUTPUT_CAP);
-  while (Buffer.byteLength(truncated, "utf8") > PER_TASK_OUTPUT_CAP) {
-    truncated = truncated.slice(0, -1);
+function utf8PrefixLength(characters: string[], maxBytes: number): number {
+  let byteLength = 0;
+  let length = 0;
+  while (length < characters.length) {
+    const nextByteLength = Buffer.byteLength(characters[length], "utf8");
+    if (byteLength + nextByteLength > maxBytes) break;
+    byteLength += nextByteLength;
+    length++;
   }
-  return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted. Full output preserved in tool details.]`;
+  return length;
+}
+
+function utf8SuffixStart(characters: string[], maxBytes: number): number {
+  let byteLength = 0;
+  let start = characters.length;
+  while (start > 0) {
+    const nextByteLength = Buffer.byteLength(characters[start - 1], "utf8");
+    if (byteLength + nextByteLength > maxBytes) break;
+    byteLength += nextByteLength;
+    start--;
+  }
+  return start;
+}
+
+export function truncateModelVisibleOutput(output: string, artifactPath?: string): string {
+  if (Buffer.byteLength(output, "utf8") <= MODEL_VISIBLE_OUTPUT_BUDGET) return output;
+
+  const characters = Array.from(output);
+  const markerForBudget = formatTruncationMarker(characters.length, artifactPath);
+  const markerBytes = Buffer.byteLength(markerForBudget, "utf8");
+  if (markerBytes > MODEL_VISIBLE_OUTPUT_BUDGET) {
+    throw new Error("Output truncation marker exceeds the model-visible output budget");
+  }
+
+  const availableBytes = MODEL_VISIBLE_OUTPUT_BUDGET - markerBytes;
+  const prefixLength = utf8PrefixLength(characters, Math.floor(availableBytes / 2));
+  const suffixStart = utf8SuffixStart(characters, Math.ceil(availableBytes / 2));
+  const retainedCharacters = prefixLength + (characters.length - suffixStart);
+
+  return `${characters.slice(0, prefixLength).join("")}${formatTruncationMarker(
+    characters.length - retainedCharacters,
+    artifactPath,
+  )}${characters.slice(suffixStart).join("")}`;
+}
+
+function sanitizeArtifactComponent(value: string): string {
+  const sanitized = value
+    .replace(/[^a-zA-Z0-9._-]+/g, "_")
+    .replace(/^\.+/, "")
+    .slice(0, 80);
+  return sanitized || "unknown";
+}
+
+type ArtifactCreatedCallback = (artifactDirectory: string) => void;
+
+async function writeOutputArtifact(
+  toolCallId: string,
+  label: string,
+  output: string,
+  onArtifactCreated?: ArtifactCreatedCallback,
+): Promise<string> {
+  const artifactDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-output-"));
+  const artifactPath = path.resolve(
+    artifactDir,
+    `output-${sanitizeArtifactComponent(toolCallId)}-${sanitizeArtifactComponent(label)}-${randomUUID()}.txt`,
+  );
+
+  try {
+    try {
+      await fs.promises.chmod(artifactDir, 0o700);
+    } catch {
+      /* best effort: mkdtemp already creates a private directory */
+    }
+    await withFileMutationQueue(artifactPath, async () => {
+      await fs.promises.writeFile(artifactPath, output, {
+        encoding: "utf8",
+        flag: "wx",
+        mode: 0o600,
+      });
+      try {
+        await fs.promises.chmod(artifactPath, 0o600);
+      } catch {
+        /* best effort on platforms without chmod support */
+      }
+    });
+  } catch (error) {
+    try {
+      await fs.promises.rm(artifactDir, { force: true, recursive: true });
+    } catch {
+      /* best effort cleanup before preserving the original write error */
+    }
+    throw error;
+  }
+
+  onArtifactCreated?.(artifactDir);
+  return artifactPath;
+}
+
+export async function prepareModelVisibleOutput(
+  output: string,
+  toolCallId: string,
+  label = "final-output",
+  onArtifactCreated?: ArtifactCreatedCallback,
+): Promise<string> {
+  if (Buffer.byteLength(output, "utf8") <= MODEL_VISIBLE_OUTPUT_BUDGET) return output;
+
+  const artifactPath = await writeOutputArtifact(toolCallId, label, output, onArtifactCreated);
+  return truncateModelVisibleOutput(output, artifactPath);
+}
+
+export function formatParallelAggregateOutput(results: SingleResult[]): string {
+  const successCount = results.filter((r) => !isFailedResult(r)).length;
+  const summaries = results.map((r) => {
+    const status = isFailedResult(r)
+      ? `failed${r.stopReason && r.stopReason !== "end" ? ` (${r.stopReason})` : ""}`
+      : "completed";
+    return `### [${r.agent}] ${status}\n\n${getResultOutput(r)}`;
+  });
+
+  return `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}`;
+}
+
+function takeUtf8Prefix(output: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  if (Buffer.byteLength(output, "utf8") <= maxBytes) return output;
+
+  const characters = Array.from(output);
+  return characters.slice(0, utf8PrefixLength(characters, maxBytes)).join("");
+}
+
+function formatParallelAggregateForModel(
+  results: SingleResult[],
+  artifactPath: string,
+  fullOutput: string,
+): string {
+  const successCount = results.filter((r) => !isFailedResult(r)).length;
+  const header = `Parallel: ${successCount}/${results.length} succeeded`;
+  const separator = "\n\n---\n\n";
+  const headings = results.map((r) => {
+    const status = isFailedResult(r)
+      ? `failed${r.stopReason && r.stopReason !== "end" ? ` (${r.stopReason})` : ""}`
+      : "completed";
+    return `### [${r.agent}] ${status}`;
+  });
+  const marker = formatTruncationMarker(fullOutput.length, artifactPath);
+  const fixedOutput = `${header}\n\n${headings.map((heading) => `${heading}\n\n`).join(separator)}`;
+  const availableBytes = Math.max(
+    0,
+    MODEL_VISIBLE_OUTPUT_BUDGET -
+      Buffer.byteLength(fixedOutput, "utf8") -
+      Buffer.byteLength(marker, "utf8"),
+  );
+  const perResultBudget = results.length > 0 ? Math.floor(availableBytes / results.length) : 0;
+  const summaries = results.map(
+    (r, index) => `${headings[index]}\n\n${takeUtf8Prefix(getResultOutput(r), perResultBudget)}`,
+  );
+
+  return `${header}\n\n${summaries.join(separator)}${marker}`;
+}
+
+export async function prepareParallelAggregateOutput(
+  results: SingleResult[],
+  toolCallId: string,
+  onArtifactCreated?: ArtifactCreatedCallback,
+): Promise<string> {
+  const aggregate = formatParallelAggregateOutput(results);
+  if (Buffer.byteLength(aggregate, "utf8") <= MODEL_VISIBLE_OUTPUT_BUDGET) return aggregate;
+
+  const artifactPath = await writeOutputArtifact(
+    toolCallId,
+    "parallel-aggregate",
+    aggregate,
+    onArtifactCreated,
+  );
+  return formatParallelAggregateForModel(results, artifactPath, aggregate);
 }
 
 type DisplayItem =
@@ -288,7 +470,83 @@ interface DispatchDefaults {
   thinkingLevel?: ThinkingLevel;
 }
 
-async function runSingleAgent(
+export interface ProcessExitStatus {
+  exitCode: number | null;
+  signalCode: NodeJS.Signals | null;
+  aborted: boolean;
+  error?: Error;
+}
+
+export function waitForProcessExit(
+  proc: ChildProcess,
+  signal?: AbortSignal,
+  abortGracePeriodMs = ABORT_GRACE_PERIOD_MS,
+): Promise<ProcessExitStatus> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let abortRequested = false;
+    let abortTimer: ReturnType<typeof setTimeout> | undefined;
+    let abortListener: (() => void) | undefined;
+
+    function cleanup(): void {
+      if (abortTimer !== undefined) {
+        clearTimeout(abortTimer);
+        abortTimer = undefined;
+      }
+      if (signal && abortListener) {
+        signal.removeEventListener("abort", abortListener);
+        abortListener = undefined;
+      }
+      proc.removeListener("close", onClose);
+      proc.removeListener("error", onError);
+    }
+
+    function settle(status: Omit<ProcessExitStatus, "aborted">): void {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve({ ...status, aborted: abortRequested });
+    }
+
+    function onClose(exitCode: number | null, signalCode: NodeJS.Signals | null): void {
+      settle({ exitCode, signalCode: signalCode ?? null });
+    }
+
+    function onError(error: Error): void {
+      settle({ exitCode: 1, signalCode: null, error });
+    }
+
+    function requestAbort(): void {
+      if (settled || abortRequested) return;
+      abortRequested = true;
+      abortTimer = setTimeout(() => {
+        abortTimer = undefined;
+        if (settled || proc.exitCode !== null || proc.signalCode !== null) return;
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          /* best effort: the process may have exited while the timer fired */
+        }
+      }, abortGracePeriodMs);
+      try {
+        proc.kill("SIGTERM");
+      } catch (error) {
+        settle({ exitCode: 1, signalCode: null, error: error as Error });
+      }
+    }
+
+    proc.once("close", onClose);
+    proc.once("error", onError);
+
+    if (signal) {
+      abortListener = requestAbort;
+      if (signal.aborted) requestAbort();
+      else signal.addEventListener("abort", abortListener, { once: true });
+    }
+  });
+}
+
+export async function runSingleAgent(
   defaultCwd: string,
   dispatchDefaults: DispatchDefaults,
   agents: AgentConfig[],
@@ -362,7 +620,9 @@ async function runSingleAgent(
         content: [
           {
             type: "text",
-            text: getFinalOutput(currentResult.messages) || "(running...)",
+            text: truncateModelVisibleOutput(
+              getFinalOutput(currentResult.messages) || "(running...)",
+            ),
           },
         ],
         details: makeDetails([currentResult]),
@@ -379,89 +639,85 @@ async function runSingleAgent(
     }
 
     args.push(`Task: ${task}`);
-    let wasAborted = false;
+    const invocation = getPiInvocation(args);
+    const proc = spawn(invocation.command, invocation.args, {
+      cwd: cwd ?? defaultCwd,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
+    let buffer = "";
+    let streamsFlushed = false;
 
-    const exitCode = await new Promise<number>((resolve) => {
-      const invocation = getPiInvocation(args);
-      const proc = spawn(invocation.command, invocation.args, {
-        cwd: cwd ?? defaultCwd,
-        shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      let buffer = "";
-
-      const processLine = (line: string) => {
-        if (!line.trim()) return;
-        let event: any;
-        try {
-          event = JSON.parse(line);
-        } catch {
-          return;
-        }
-
-        if (event.type === "message_end" && event.message) {
-          const msg = event.message as Message;
-          currentResult.messages.push(msg);
-
-          if (msg.role === "assistant") {
-            currentResult.usage.turns++;
-            const usage = msg.usage;
-            if (usage) {
-              currentResult.usage.input += usage.input || 0;
-              currentResult.usage.output += usage.output || 0;
-              currentResult.usage.cacheRead += usage.cacheRead || 0;
-              currentResult.usage.cacheWrite += usage.cacheWrite || 0;
-              currentResult.usage.cost += usage.cost?.total || 0;
-              currentResult.usage.contextTokens = usage.totalTokens || 0;
-            }
-            if (!currentResult.model && msg.model) currentResult.model = msg.model;
-            if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-            if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
-          }
-          emitUpdate();
-        }
-
-        if (event.type === "tool_result_end" && event.message) {
-          currentResult.messages.push(event.message as Message);
-          emitUpdate();
-        }
-      };
-
-      proc.stdout.on("data", (data) => {
-        buffer += data.toString();
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-        for (const line of lines) processLine(line);
-      });
-
-      proc.stderr.on("data", (data) => {
-        currentResult.stderr += data.toString();
-      });
-
-      proc.on("close", (code) => {
-        if (buffer.trim()) processLine(buffer);
-        resolve(code ?? 0);
-      });
-
-      proc.on("error", () => {
-        resolve(1);
-      });
-
-      if (signal) {
-        const killProc = () => {
-          wasAborted = true;
-          proc.kill("SIGTERM");
-          setTimeout(() => {
-            if (!proc.killed) proc.kill("SIGKILL");
-          }, 5000);
-        };
-        if (signal.aborted) killProc();
-        else signal.addEventListener("abort", killProc, { once: true });
+    const processLine = (line: string) => {
+      if (!line.trim()) return;
+      let event: any;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        return;
       }
+
+      if (event.type === "message_end" && event.message) {
+        const msg = event.message as Message;
+        currentResult.messages.push(msg);
+
+        if (msg.role === "assistant") {
+          currentResult.usage.turns++;
+          const usage = msg.usage;
+          if (usage) {
+            currentResult.usage.input += usage.input || 0;
+            currentResult.usage.output += usage.output || 0;
+            currentResult.usage.cacheRead += usage.cacheRead || 0;
+            currentResult.usage.cacheWrite += usage.cacheWrite || 0;
+            currentResult.usage.cost += usage.cost?.total || 0;
+            currentResult.usage.contextTokens = usage.totalTokens || 0;
+          }
+          if (!currentResult.model && msg.model) currentResult.model = msg.model;
+          if (msg.stopReason) currentResult.stopReason = msg.stopReason;
+          if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
+        }
+        emitUpdate();
+      }
+
+      if (event.type === "tool_result_end" && event.message) {
+        currentResult.messages.push(event.message as Message);
+        emitUpdate();
+      }
+    };
+
+    const processStdoutChunk = (chunk: string) => {
+      buffer += chunk;
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) processLine(line);
+    };
+
+    const flushStreams = () => {
+      if (streamsFlushed) return;
+      streamsFlushed = true;
+      processStdoutChunk(stdoutDecoder.end());
+      currentResult.stderr += stderrDecoder.end();
+      if (buffer.trim()) processLine(buffer);
+      buffer = "";
+    };
+
+    proc.stdout.on("data", (data) => {
+      if (!streamsFlushed) processStdoutChunk(stdoutDecoder.write(data));
     });
 
-    currentResult.exitCode = exitCode;
-    if (wasAborted) throw new Error("Subagent was aborted");
+    proc.stderr.on("data", (data) => {
+      if (!streamsFlushed) currentResult.stderr += stderrDecoder.write(data);
+    });
+
+    const processExit = await waitForProcessExit(proc, signal);
+    flushStreams();
+
+    currentResult.exitCode = processExit.exitCode ?? 1;
+    currentResult.signalCode = processExit.signalCode;
+    if (processExit.error) currentResult.errorMessage = processExit.error.message;
+    if (processExit.aborted) throw new Error("Subagent was aborted");
     return currentResult;
   } finally {
     if (tmpPromptPath)
@@ -529,6 +785,23 @@ const SubagentParams = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
+  const overflowArtifactDirectories = new Set<string>();
+  const onArtifactCreated: ArtifactCreatedCallback = (directory) => {
+    overflowArtifactDirectories.add(directory);
+  };
+
+  pi.on("session_shutdown", async () => {
+    const directories = Array.from(overflowArtifactDirectories);
+    overflowArtifactDirectories.clear();
+    for (const directory of directories) {
+      try {
+        await fs.promises.rm(directory, { force: true, recursive: true });
+      } catch {
+        /* best effort cleanup */
+      }
+    }
+  });
+
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
@@ -540,7 +813,7 @@ export default function (pi: ExtensionAPI) {
     ].join(" "),
     parameters: SubagentParams,
 
-    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
       const agentScope: AgentScope = params.agentScope ?? "user";
       const dispatchDefaults: DispatchDefaults = {
         model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
@@ -650,7 +923,12 @@ export default function (pi: ExtensionAPI) {
               content: [
                 {
                   type: "text",
-                  text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}`,
+                  text: await prepareModelVisibleOutput(
+                    `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}`,
+                    toolCallId,
+                    `chain-step-${i + 1}`,
+                    onArtifactCreated,
+                  ),
                 },
               ],
               details: makeDetails("chain")(results),
@@ -663,7 +941,12 @@ export default function (pi: ExtensionAPI) {
           content: [
             {
               type: "text",
-              text: getFinalOutput(results[results.length - 1].messages) || "(no output)",
+              text: await prepareModelVisibleOutput(
+                getFinalOutput(results[results.length - 1].messages) || "(no output)",
+                toolCallId,
+                "chain-final",
+                onArtifactCreated,
+              ),
             },
           ],
           details: makeDetails("chain")(results),
@@ -750,19 +1033,11 @@ export default function (pi: ExtensionAPI) {
           },
         );
 
-        const successCount = results.filter((r) => !isFailedResult(r)).length;
-        const summaries = results.map((r) => {
-          const output = truncateParallelOutput(getResultOutput(r));
-          const status = isFailedResult(r)
-            ? `failed${r.stopReason && r.stopReason !== "end" ? ` (${r.stopReason})` : ""}`
-            : "completed";
-          return `### [${r.agent}] ${status}\n\n${output}`;
-        });
         return {
           content: [
             {
               type: "text",
-              text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}`,
+              text: await prepareParallelAggregateOutput(results, toolCallId, onArtifactCreated),
             },
           ],
           details: makeDetails("parallel")(results),
@@ -789,7 +1064,12 @@ export default function (pi: ExtensionAPI) {
             content: [
               {
                 type: "text",
-                text: `Agent ${result.stopReason || "failed"}: ${errorMsg}`,
+                text: await prepareModelVisibleOutput(
+                  `Agent ${result.stopReason || "failed"}: ${errorMsg}`,
+                  toolCallId,
+                  "single-failure",
+                  onArtifactCreated,
+                ),
               },
             ],
             details: makeDetails("single")([result]),
@@ -797,7 +1077,17 @@ export default function (pi: ExtensionAPI) {
           };
         }
         return {
-          content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
+          content: [
+            {
+              type: "text",
+              text: await prepareModelVisibleOutput(
+                getFinalOutput(result.messages) || "(no output)",
+                toolCallId,
+                "single-final",
+                onArtifactCreated,
+              ),
+            },
+          ],
           details: makeDetails("single")([result]),
         };
       }
