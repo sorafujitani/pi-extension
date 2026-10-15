@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import "./expose-tool.js";
 import { Type } from "typebox";
 
 const DEFAULT_LIMIT = 120;
@@ -393,6 +394,7 @@ function gitError(operation: string, result: ExecResult): Error {
 export default function gitRefExplorer(pi: ExtensionAPI) {
   pi.registerTool({
     name: "git_ref_explorer",
+    exposure: "deferred",
     label: "Git Ref Explorer",
     description:
       "Search, read, or diff committed Git content at arbitrary refs without changing the worktree. Results include resolved commit hashes, source line numbers where applicable, and bounded pagination (maximum 500 rows and 30KB per call).",

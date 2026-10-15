@@ -12,12 +12,15 @@
   ],
   "type": "module",
   "dependencies": {
+    "jiti": "2.7.0",
+    "pi-btw": "0.7.1",
     "safe-regex": "^2.1.1"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^0.84.2",
-    "@earendil-works/pi-coding-agent": "^0.84.2",
-    "@earendil-works/pi-tui": "^0.84.2",
+    "@earendil-works/pi-agent-core": "^1.0.0",
+    "@earendil-works/pi-ai": "^1.0.0",
+    "@earendil-works/pi-coding-agent": "^1.0.0",
+    "@earendil-works/pi-tui": "^1.0.0",
     "@types/node": "^24.0.0",
     "@types/safe-regex": "^1.1.6",
     "typebox": "^1.3.7",
@@ -25,6 +28,7 @@
     "vite-plus": "0.2.7"
   },
   "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
@@ -33,7 +37,9 @@
   "packageManager": "pnpm@11.22.0",
   "pi": {
     "extensions": [
-      "./extensions"
+      "./extensions",
+      "!extensions/host-compat.ts",
+      "!extensions/expose-tool.ts"
     ]
   }
 }

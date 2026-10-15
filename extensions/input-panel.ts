@@ -4,37 +4,12 @@ import { CustomEditor } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import {
   collectRecentUsage,
-  collectSessionUsage,
-  formatUsageHeader,
-  formatUsageHeaderCompact,
+  collectUsageMetrics,
+  formatTokens,
+  getCacheHitRate,
 } from "./session-usage.js";
 
-type ThinkingColor =
-  | "thinkingOff"
-  | "thinkingMinimal"
-  | "thinkingLow"
-  | "thinkingMedium"
-  | "thinkingHigh"
-  | "thinkingXhigh"
-  | "thinkingMax";
-
-const THINKING_COLORS: Record<string, ThinkingColor> = {
-  off: "thinkingOff",
-  minimal: "thinkingMinimal",
-  low: "thinkingLow",
-  medium: "thinkingMedium",
-  high: "thinkingHigh",
-  xhigh: "thinkingXhigh",
-  max: "thinkingMax",
-};
 const ANSI_ESCAPE_PATTERN = new RegExp(String.fromCharCode(0x1b) + "\\[[0-?]*[ -/]*[@-~]", "g");
-
-function formatTokens(count: number): string {
-  if (count < 1_000) return `${count}`;
-  if (count < 10_000) return `${(count / 1_000).toFixed(1)}k`;
-  if (count < 1_000_000) return `${Math.round(count / 1_000)}k`;
-  return `${(count / 1_000_000).toFixed(count < 10_000_000 ? 1 : 0)}M`;
-}
 
 function formatCwd(cwd: string): string {
   const home = homedir();
@@ -55,22 +30,28 @@ function buildTopBorder(width: number, ctx: ExtensionContext, theme: Theme): str
 
   const model = ctx.model?.id ?? "no-model";
   const thinking = ctx.thinkingLevel ?? "off";
-  const thinkingColor = THINKING_COLORS[thinking] ?? "thinkingOff";
   const separator = theme.fg("borderMuted", "  ·  ");
-  const sessionUsage = collectSessionUsage(ctx.sessionManager.getEntries());
-  const recentUsage = collectRecentUsage(ctx.sessionManager.getBranch());
+  const session = collectUsageMetrics(ctx.sessionManager.getEntries());
+  const recent = collectRecentUsage(ctx.sessionManager.getBranch());
+  const cache = getCacheHitRate(session);
+  const windowLabel = recent.requests
+    ? `1m ${recent.requests}r in${formatTokens(recent.promptTokens)}/u${formatTokens(recent.uncachedInput)} out${formatTokens(recent.output)}`
+    : "1m —";
+  const cacheLabel = cache === undefined ? "—" : `${cache.toFixed(1)}%`;
   const prefixSegments = [
     theme.fg("accent", model),
-    theme.fg(thinkingColor, `◐ ${thinking}`),
+    theme.getThinkingBorderColor(thinking)(`◐ ${thinking}`),
     theme.fg("text", contextLabel(ctx)),
   ];
   const cwdSegment = theme.fg("muted", `⌂ ${formatCwd(ctx.cwd)}`);
   const buildContent = (usageLabel: string): string =>
     `─ ${[...prefixSegments, theme.fg("muted", usageLabel), cwdSegment].join(separator)} `;
 
-  let content = buildContent(formatUsageHeader(sessionUsage, recentUsage));
+  let content = buildContent(
+    `${windowLabel} · cache${cacheLabel} · session${formatTokens(session.total)}`,
+  );
   if (visibleWidth(content) > width) {
-    content = buildContent(formatUsageHeaderCompact(sessionUsage, recentUsage));
+    content = buildContent(`${windowLabel} · c${cacheLabel} · s${formatTokens(session.total)}`);
   }
   content = truncateToWidth(content, width, "");
   return content + theme.fg("borderMuted", "─".repeat(Math.max(0, width - visibleWidth(content))));
@@ -84,13 +65,10 @@ class InputPanelEditor extends CustomEditor {
     tui: EditorConstructor[0],
     theme: EditorConstructor[1],
     keybindings: EditorConstructor[2],
-    metadata: (width: number) => string,
+    private readonly metadata: (width: number) => string,
   ) {
     super(tui, theme, keybindings);
-    this.metadata = metadata;
   }
-
-  private readonly metadata: (width: number) => string;
 
   render(width: number): string[] {
     if (width < 5) return super.render(width);
@@ -117,7 +95,6 @@ class InputPanelEditor extends CustomEditor {
 
 export default function (pi: ExtensionAPI) {
   let enabled = true;
-  let previousEditorFactory: EditorFactory | undefined;
   let panelContext: ExtensionContext | undefined;
   const panelFactory: EditorFactory = (tui, editorTheme, keybindings) =>
     new InputPanelEditor(tui, editorTheme, keybindings, (width) => {
@@ -131,9 +108,8 @@ export default function (pi: ExtensionAPI) {
     const currentEditorFactory = ctx.ui.getEditorComponent();
     if (!enabled) {
       if (currentEditorFactory === panelFactory) {
-        ctx.ui.setEditorComponent(previousEditorFactory);
+        ctx.ui.setEditorComponent(undefined);
       }
-      previousEditorFactory = undefined;
       panelContext = undefined;
       return;
     }
@@ -145,7 +121,6 @@ export default function (pi: ExtensionAPI) {
     // Arbitrary custom editors cannot be safely composed without a delegation contract.
     if (currentEditorFactory) return;
 
-    previousEditorFactory = currentEditorFactory;
     panelContext = ctx;
     ctx.ui.setEditorComponent(panelFactory);
   }

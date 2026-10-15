@@ -3,7 +3,11 @@ import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
-import { runSingleAgent, waitForProcessExit } from "../extensions/subagent/index.js";
+import {
+  formatUsageStats,
+  runSingleAgent,
+  waitForProcessExit,
+} from "../extensions/subagent/index.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -22,6 +26,24 @@ function spawnNode(script: string) {
 }
 
 describe("subagent process lifecycle", () => {
+  it("includes the reasoning effort in usage metadata", () => {
+    expect(
+      formatUsageStats(
+        {
+          input: 1_234,
+          output: 345,
+          cacheRead: 4_567,
+          cacheWrite: 78,
+          cost: 0.1234,
+          contextTokens: 5_678,
+          turns: 2,
+        },
+        "openai-codex/gpt-5.6-luna",
+        "max",
+      ),
+    ).toBe("2 turns ↑1.2k ↓345 R4.6k W78 $0.1234 ctx:5.7k openai-codex/gpt-5.6-luna effort:max");
+  });
+
   it("does not treat a non-zero process exit as success", async () => {
     const status = await waitForProcessExit(spawnNode("process.exit(7)"));
 
@@ -159,6 +181,181 @@ setTimeout(() => {
       expect((result.messages[0].content[0] as { text: string }).text).toBe(messageText);
       expect(result.stderr).toBe(stderrText);
       expect(result.stderr).not.toContain("\\uFFFD");
+    } finally {
+      process.argv.splice(0, process.argv.length, ...originalArgv);
+    }
+  });
+
+  it("persists a session id instead of using --no-session", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-subagent-session-test-"));
+    temporaryDirectories.push(directory);
+    const scriptPath = join(directory, "fake-pi.mjs");
+    await writeFile(
+      scriptPath,
+      `const sessionIndex = process.argv.indexOf("--session-id");
+if (process.argv.includes("--no-session")) process.exit(3);
+if (sessionIndex < 0 || !process.argv[sessionIndex + 1]) process.exit(2);
+const sessionId = process.argv[sessionIndex + 1];
+const message = {
+  role: "assistant",
+  content: [{ type: "text", text: sessionId }],
+  api: "openai-responses",
+  provider: "openai",
+  model: "test-model",
+  usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+  stopReason: "stop",
+  timestamp: 0,
+};
+process.stdout.write(JSON.stringify({ type: "session", id: sessionId }) + "\\n");
+process.stdout.write(JSON.stringify({ type: "message_end", message }) + "\\n");
+`,
+      "utf8",
+    );
+    const originalArgv = [...process.argv];
+    try {
+      process.argv[1] = scriptPath;
+      const result = await runSingleAgent(
+        process.cwd(),
+        {},
+        [
+          {
+            name: "session-agent",
+            description: "test agent",
+            systemPrompt: "",
+            source: "user",
+            filePath: scriptPath,
+          },
+        ],
+        "session-agent",
+        "keep a session",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        (results) => ({
+          mode: "single",
+          agentScope: "user",
+          projectAgentsDir: null,
+          results,
+        }),
+        { timeoutMs: 2_000 },
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.sessionId).toBeTruthy();
+      expect((result.messages[0].content[0] as { text: string }).text).toBe(result.sessionId);
+    } finally {
+      process.argv.splice(0, process.argv.length, ...originalArgv);
+    }
+  });
+
+  it("times out a hung child and returns the session id", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(join(tmpdir(), "pi-subagent-timeout-test-"));
+    temporaryDirectories.push(directory);
+    const scriptPath = join(directory, "fake-pi.mjs");
+    await writeFile(scriptPath, "setTimeout(() => {}, 10_000);\n", "utf8");
+    const originalArgv = [...process.argv];
+    try {
+      process.argv[1] = scriptPath;
+      const result = await runSingleAgent(
+        process.cwd(),
+        {},
+        [
+          {
+            name: "hang-agent",
+            description: "test agent",
+            systemPrompt: "",
+            source: "user",
+            filePath: scriptPath,
+          },
+        ],
+        "hang-agent",
+        "hang",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        (results) => ({
+          mode: "single",
+          agentScope: "user",
+          projectAgentsDir: null,
+          results,
+        }),
+        { timeoutMs: 80, sessionId: "timeout-session" },
+      );
+      expect(result.timedOut).toBe(true);
+      expect(result.exitCode).toBe(1);
+      expect(result.sessionId).toBe("timeout-session");
+      expect(result.errorMessage).toContain("timed out");
+      expect(result.errorMessage).toContain("timeout-session");
+    } finally {
+      process.argv.splice(0, process.argv.length, ...originalArgv);
+    }
+  });
+
+  it("surfaces tool_execution_start before the child exits", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-subagent-live-tool-test-"));
+    temporaryDirectories.push(directory);
+    const scriptPath = join(directory, "fake-pi.mjs");
+    await writeFile(
+      scriptPath,
+      `process.stdout.write(JSON.stringify({
+  type: "tool_execution_start",
+  toolCallId: "t1",
+  toolName: "bash",
+  args: { command: "sleep 1" },
+}) + "\\n");
+process.stdout.write(JSON.stringify({
+  type: "message_end",
+  message: {
+    role: "assistant",
+    content: [{ type: "text", text: "done" }],
+    api: "openai-responses",
+    provider: "openai",
+    model: "test-model",
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason: "stop",
+    timestamp: 0,
+  },
+}) + "\\n");
+`,
+      "utf8",
+    );
+    const originalArgv = [...process.argv];
+    const updates: Array<{ name?: string }> = [];
+    try {
+      process.argv[1] = scriptPath;
+      const result = await runSingleAgent(
+        process.cwd(),
+        {},
+        [
+          {
+            name: "live-agent",
+            description: "test agent",
+            systemPrompt: "",
+            source: "user",
+            filePath: scriptPath,
+          },
+        ],
+        "live-agent",
+        "show tools",
+        undefined,
+        undefined,
+        undefined,
+        (partial) => {
+          updates.push({ name: partial.details?.results[0]?.liveTools?.at(-1)?.name });
+        },
+        (results) => ({
+          mode: "single",
+          agentScope: "user",
+          projectAgentsDir: null,
+          results,
+        }),
+        { timeoutMs: 2_000 },
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.liveTools?.some((tool) => tool.name === "bash")).toBe(true);
+      expect(updates.some((update) => update.name === "bash")).toBe(true);
     } finally {
       process.argv.splice(0, process.argv.length, ...originalArgv);
     }

@@ -2,12 +2,13 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import safeRegex from "safe-regex";
 import {
-  CONFIG_DIR_NAME,
   getAgentDir,
   type ExtensionAPI,
   type ExtensionContext,
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
+import "./expose-tool.js";
+import { hostConfigDirName, hostToolNames, isProjectTrusted } from "./host-compat.js";
 import { Type } from "typebox";
 
 export const ACTIVATION_TOOL_NAME = "activate_tool_groups";
@@ -267,7 +268,7 @@ export function loadLazyToolGroups(
   agentDir: string,
   cwd: string,
   projectTrusted: boolean,
-  configDirName = CONFIG_DIR_NAME,
+  configDirName = hostConfigDirName(agentDir),
 ): LazyToolsConfigResult {
   const global = readLazyToolsConfig(join(agentDir, LAZY_TOOLS_CONFIG_FILE));
   const sources: ReadonlyMap<string, LazyToolGroupDefinition>[] = [DEFAULT_GROUPS, global.groups];
@@ -363,12 +364,14 @@ export function createLazyToolsExtension(
   pi: ExtensionAPI,
   options: LazyToolsExtensionOptions = {},
 ): void {
+  const agentDir = options.agentDir ?? getAgentDir();
+  const configDirName = options.configDirName ?? hostConfigDirName(agentDir);
   let groups = new Map<string, LazyToolGroup>();
   let activeGroups = new Set<string>();
   let registeredTools = new Set<string>();
 
   function refreshRegisteredTools(): void {
-    registeredTools = new Set(pi.getAllTools().map((tool) => tool.name));
+    registeredTools = new Set(hostToolNames(pi.getAllTools()));
   }
 
   function groupTools(groupNames: Iterable<string>): string[] {
@@ -454,11 +457,13 @@ export function createLazyToolsExtension(
     const availableGroups = [...groups.keys()].join(", ") || "(none)";
     pi.registerTool({
       name: ACTIVATION_TOOL_NAME,
+      exposure: "model-only",
       label: "Activate Tool Groups",
       description: `Activate one or more configured lazy tool groups. Available groups: ${availableGroups}.`,
       promptSnippet: "Activate configured tool groups when the current tools are not enough",
       promptGuidelines: [
-        "Use activate_tool_groups to activate a configured group before calling one of its tools.",
+        "Do not activate a group for one search. Call undeclared tools from codemode, or use tool_search when a direct call is required.",
+        "Activate delegation before the subagent tool. It is not callable from codemode.",
       ],
       parameters: Type.Object({
         groups: Type.Array(Type.String({ minLength: 1 }), {
@@ -475,6 +480,22 @@ export function createLazyToolsExtension(
       },
     });
   }
+
+  let registeredGroupSignature: string | undefined;
+
+  // Hosts may reject registerTool after load, so register during load and
+  // re-register only when a later config read changes the group set.
+  function syncActivationTool(): void {
+    const signature = [...groups.keys()].sort().join(",");
+    if (signature === registeredGroupSignature) return;
+    registeredGroupSignature = signature;
+    registerActivationTool();
+  }
+
+  // Project config needs a session (cwd + trust); the global file is enough to
+  // name the groups in the tool description.
+  groups = loadLazyToolGroups(agentDir, process.cwd(), false, configDirName).groups;
+  syncActivationTool();
 
   pi.registerCommand("lazy-tools", {
     description: "Show or change lazy tool groups: status, activate <groups...>, reset",
@@ -510,15 +531,10 @@ export function createLazyToolsExtension(
 
   pi.on("session_start", (_event, ctx) => {
     reconciledForSession = false;
-    const loaded = loadLazyToolGroups(
-      options.agentDir ?? getAgentDir(),
-      ctx.cwd,
-      ctx.isProjectTrusted(),
-      options.configDirName ?? CONFIG_DIR_NAME,
-    );
+    const loaded = loadLazyToolGroups(agentDir, ctx.cwd, isProjectTrusted(ctx), configDirName);
     groups = loaded.groups;
     for (const message of loaded.warnings) notify(ctx, message, "warning");
-    registerActivationTool();
+    syncActivationTool();
     restoreFromBranch(ctx);
   });
 

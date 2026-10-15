@@ -3,8 +3,6 @@ import { describe, expect, it } from "vite-plus/test";
 import sessionUsage, {
   collectRecentUsage,
   collectSessionUsage,
-  formatSessionUsageCompact,
-  formatUsageWindowCompact,
   getCacheHitRate,
   hasSessionUsage,
 } from "../extensions/session-usage.js";
@@ -57,22 +55,6 @@ describe("session usage", () => {
       total: 140,
       cost: 0.3,
     });
-  });
-
-  it("formats compact usage for persistent UI", () => {
-    expect(
-      formatSessionUsageCompact({
-        turns: 1,
-        userMessages: 1,
-        toolCalls: 0,
-        input: 1_000,
-        output: 200,
-        cacheRead: 300,
-        cacheWrite: 0,
-        total: 1_500,
-        cost: 0.5,
-      }),
-    ).toBe("session 1.5k tok · 1 turn ↑1.0k ↓200 R300 $0.500");
   });
 
   it("separates full prompt volume from uncached input in the rate window", () => {
@@ -128,7 +110,48 @@ describe("session usage", () => {
       maxOutput: 20,
     });
     expect(getCacheHitRate(recent)).toBeCloseTo(89.1089, 3);
-    expect(formatUsageWindowCompact(recent)).toBe("1m 1r in1.0k/u110 out20");
+  });
+
+  it("counts cache warming without inventing turns or erasing edited-history usage", () => {
+    const now = Date.parse("2026-09-22T00:00:00.000Z");
+    const entries = [
+      {
+        type: "message",
+        id: "response",
+        message: {
+          role: "assistant",
+          timestamp: now,
+          content: [],
+          usage: { input: 100, output: 20, cost: { total: 0.25 } },
+        },
+      },
+      { type: "context_edit", targetId: "response", replacement: null },
+      {
+        type: "usage",
+        kind: "cache_warm",
+        provider: "anthropic",
+        model: "test-model",
+        timestamp: new Date(now).toISOString(),
+        usage: { cacheRead: 100, output: 1, cost: { total: 0.05 } },
+      },
+    ] as unknown as Parameters<typeof collectSessionUsage>[0];
+
+    expect(collectSessionUsage(entries)).toMatchObject({
+      turns: 1,
+      userMessages: 0,
+      input: 100,
+      cacheRead: 100,
+      output: 21,
+      total: 221,
+      cost: 0.3,
+    });
+    expect(collectRecentUsage(entries, now)).toMatchObject({
+      requests: 2,
+      promptTokens: 200,
+      total: 221,
+      cost: 0.3,
+    });
+    expect(collectRecentUsage(entries, now + 60_001).requests).toBe(0);
   });
 
   it("recognizes empty sessions", () => {

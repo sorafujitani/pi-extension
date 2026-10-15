@@ -22,12 +22,13 @@ import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
   type AgentToolResult,
-  CONFIG_DIR_NAME,
   type ExtensionAPI,
   getAgentDir,
   getMarkdownTheme,
   withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
+import { hostConfigDirName } from "../host-compat.js";
+import "./../expose-tool.js";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents, type ThinkingLevel } from "./agents.js";
@@ -37,6 +38,8 @@ const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const ABORT_GRACE_PERIOD_MS = 5_000;
+const HEARTBEAT_INTERVAL_MS = 15_000;
+export const DEFAULT_SUBAGENT_TIMEOUT_MS = 30 * 60 * 1000;
 export const MODEL_VISIBLE_OUTPUT_BUDGET = 12 * 1024;
 
 function formatTokens(count: number): string {
@@ -46,7 +49,7 @@ function formatTokens(count: number): string {
   return `${(count / 1000000).toFixed(1)}M`;
 }
 
-function formatUsageStats(
+export function formatUsageStats(
   usage: {
     input: number;
     output: number;
@@ -57,6 +60,7 @@ function formatUsageStats(
     turns?: number;
   },
   model?: string,
+  thinkingLevel?: ThinkingLevel,
 ): string {
   const parts: string[] = [];
   if (usage.turns) parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
@@ -69,6 +73,7 @@ function formatUsageStats(
     parts.push(`ctx:${formatTokens(usage.contextTokens)}`);
   }
   if (model) parts.push(model);
+  if (thinkingLevel) parts.push(`effort:${thinkingLevel}`);
   return parts.join(" ");
 }
 
@@ -154,6 +159,12 @@ interface UsageStats {
   turns: number;
 }
 
+interface LiveTool {
+  toolCallId: string;
+  name: string;
+  args: Record<string, unknown>;
+}
+
 interface SingleResult {
   agent: string;
   agentSource: "user" | "project" | "unknown";
@@ -163,10 +174,15 @@ interface SingleResult {
   stderr: string;
   usage: UsageStats;
   model?: string;
+  thinkingLevel?: ThinkingLevel;
   stopReason?: string;
   errorMessage?: string;
   signalCode?: NodeJS.Signals | null;
   step?: number;
+  sessionId?: string;
+  running?: boolean;
+  timedOut?: boolean;
+  liveTools?: LiveTool[];
 }
 
 interface SubagentDetails {
@@ -190,11 +206,33 @@ function getFinalOutput(messages: Message[]): string {
 
 function isFailedResult(result: SingleResult): boolean {
   return (
+    result.timedOut === true ||
     result.exitCode !== 0 ||
     result.signalCode != null ||
     result.stopReason === "error" ||
     result.stopReason === "aborted"
   );
+}
+
+function formatElapsed(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainingSeconds = seconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${remainingSeconds}s`;
+  return `${remainingSeconds}s`;
+}
+
+function runningStatusText(result: SingleResult, startedAt: number): string {
+  const lastTool = result.liveTools?.at(-1)?.name;
+  const parts = [
+    `running ${formatElapsed(Date.now() - startedAt)}`,
+    `${result.usage.turns} turn${result.usage.turns === 1 ? "" : "s"}`,
+  ];
+  if (lastTool) parts.push(lastTool);
+  if (result.sessionId) parts.push(`session ${result.sessionId}`);
+  return `(${parts.join(" · ")})`;
 }
 
 function getResultOutput(result: SingleResult): string {
@@ -390,7 +428,7 @@ export async function prepareParallelAggregateOutput(
 
 type DisplayItem =
   | { type: "text"; text: string }
-  | { type: "toolCall"; name: string; args: Record<string, any> };
+  | { type: "toolCall"; name: string; args: Record<string, unknown> };
 
 function getDisplayItems(messages: Message[]): DisplayItem[] {
   const items: DisplayItem[] = [];
@@ -404,6 +442,24 @@ function getDisplayItems(messages: Message[]): DisplayItem[] {
     }
   }
   return items;
+}
+
+function getProgressItems(result: SingleResult): DisplayItem[] {
+  const items = getDisplayItems(result.messages);
+  for (const tool of result.liveTools ?? []) {
+    const alreadyShown = items.some((item) => item.type === "toolCall" && item.name === tool.name);
+    if (!alreadyShown) items.push({ type: "toolCall", name: tool.name, args: tool.args });
+  }
+  return items;
+}
+
+function resultStatusIcon(
+  result: SingleResult,
+  themeFg: (color: any, text: string) => string,
+): string {
+  if (result.running) return themeFg("warning", "…");
+  if (isFailedResult(result)) return themeFg("error", "✗");
+  return themeFg("success", "✓");
 }
 
 async function mapWithConcurrencyLimit<TIn, TOut>(
@@ -469,6 +525,11 @@ interface DispatchDefaults {
   model?: string;
   thinkingLevel?: ThinkingLevel;
 }
+
+export type RunSingleAgentOptions = {
+  timeoutMs?: number;
+  sessionId?: string;
+};
 
 export interface ProcessExitStatus {
   exitCode: number | null;
@@ -557,8 +618,12 @@ export async function runSingleAgent(
   signal: AbortSignal | undefined,
   onUpdate: OnUpdateCallback | undefined,
   makeDetails: (results: SingleResult[]) => SubagentDetails,
+  options?: RunSingleAgentOptions,
 ): Promise<SingleResult> {
   const agent = agents.find((a) => a.name === agentName);
+  const sessionId = options?.sessionId ?? randomUUID();
+  const timeoutMs =
+    options?.timeoutMs === undefined ? DEFAULT_SUBAGENT_TIMEOUT_MS : options.timeoutMs;
 
   if (!agent) {
     const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
@@ -579,10 +644,12 @@ export async function runSingleAgent(
         turns: 0,
       },
       step,
+      sessionId,
+      running: false,
     };
   }
 
-  const args: string[] = ["--mode", "json", "-p", "--no-session"];
+  const args: string[] = ["--mode", "json", "-p", "--session-id", sessionId];
   const model = resolveAgentModel(agent, dispatchDefaults.model);
   const inheritsDispatchConfig = model === dispatchDefaults.model;
   const thinkingLevel =
@@ -593,6 +660,10 @@ export async function runSingleAgent(
 
   let tmpPromptDir: string | null = null;
   let tmpPromptPath: string | null = null;
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+  let abortFromParent: (() => void) | undefined;
+  const startedAt = Date.now();
 
   const currentResult: SingleResult = {
     agent: agentName,
@@ -611,18 +682,23 @@ export async function runSingleAgent(
       turns: 0,
     },
     model,
+    thinkingLevel,
     step,
+    sessionId,
+    running: true,
+    liveTools: [],
   };
 
   const emitUpdate = () => {
     if (onUpdate) {
+      const output = currentResult.running
+        ? runningStatusText(currentResult, startedAt)
+        : getFinalOutput(currentResult.messages) || "(no output)";
       onUpdate({
         content: [
           {
             type: "text",
-            text: truncateModelVisibleOutput(
-              getFinalOutput(currentResult.messages) || "(running...)",
-            ),
+            text: truncateModelVisibleOutput(output),
           },
         ],
         details: makeDetails([currentResult]),
@@ -649,6 +725,9 @@ export async function runSingleAgent(
     const stderrDecoder = new StringDecoder("utf8");
     let buffer = "";
     let streamsFlushed = false;
+    let timedOut = false;
+    const timeoutController = new AbortController();
+    abortFromParent = () => timeoutController.abort();
 
     const processLine = (line: string) => {
       if (!line.trim()) return;
@@ -656,6 +735,32 @@ export async function runSingleAgent(
       try {
         event = JSON.parse(line);
       } catch {
+        return;
+      }
+
+      if (event.type === "session" && typeof event.id === "string" && event.id.length > 0) {
+        currentResult.sessionId = event.id;
+        emitUpdate();
+        return;
+      }
+
+      if (event.type === "message_start" || event.type === "turn_start") {
+        emitUpdate();
+        return;
+      }
+
+      if (event.type === "tool_execution_start") {
+        const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : randomUUID();
+        const name = typeof event.toolName === "string" ? event.toolName : "tool";
+        const toolArgs =
+          event.args && typeof event.args === "object" && !Array.isArray(event.args)
+            ? (event.args as Record<string, unknown>)
+            : {};
+        currentResult.liveTools = [
+          ...(currentResult.liveTools ?? []).filter((tool) => tool.toolCallId !== toolCallId),
+          { toolCallId, name, args: toolArgs },
+        ];
+        emitUpdate();
         return;
       }
 
@@ -681,7 +786,10 @@ export async function runSingleAgent(
         emitUpdate();
       }
 
-      if (event.type === "tool_result_end" && event.message) {
+      if (
+        (event.type === "tool_execution_end" || event.type === "tool_result_end") &&
+        event.message
+      ) {
         currentResult.messages.push(event.message as Message);
         emitUpdate();
       }
@@ -711,15 +819,48 @@ export async function runSingleAgent(
       if (!streamsFlushed) currentResult.stderr += stderrDecoder.write(data);
     });
 
-    const processExit = await waitForProcessExit(proc, signal);
+    if (signal) {
+      if (signal.aborted) abortFromParent();
+      else signal.addEventListener("abort", abortFromParent, { once: true });
+    }
+    if (timeoutMs > 0) {
+      timeoutTimer = setTimeout(() => {
+        timedOut = true;
+        timeoutController.abort();
+      }, timeoutMs);
+      timeoutTimer.unref?.();
+    }
+    emitUpdate();
+    heartbeat = setInterval(emitUpdate, HEARTBEAT_INTERVAL_MS);
+    heartbeat.unref?.();
+
+    const processExit = await waitForProcessExit(proc, timeoutController.signal);
     flushStreams();
 
+    currentResult.running = false;
     currentResult.exitCode = processExit.exitCode ?? 1;
     currentResult.signalCode = processExit.signalCode;
     if (processExit.error) currentResult.errorMessage = processExit.error.message;
+    if (timedOut) {
+      currentResult.timedOut = true;
+      currentResult.exitCode = 1;
+      currentResult.stopReason = "error";
+      currentResult.errorMessage = [
+        `Subagent timed out after ${Math.round(timeoutMs / 1000)}s.`,
+        currentResult.sessionId ? `session_id=${currentResult.sessionId}` : undefined,
+        runningStatusText(currentResult, startedAt),
+      ]
+        .filter(Boolean)
+        .join(" ");
+      return currentResult;
+    }
     if (processExit.aborted) throw new Error("Subagent was aborted");
     return currentResult;
   } finally {
+    currentResult.running = false;
+    if (heartbeat !== undefined) clearInterval(heartbeat);
+    if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
+    if (signal && abortFromParent) signal.removeEventListener("abort", abortFromParent);
     if (tmpPromptPath)
       try {
         fs.unlinkSync(tmpPromptPath);
@@ -782,6 +923,13 @@ const SubagentParams = Type.Object({
       description: "Working directory for the agent process (single mode)",
     }),
   ),
+  timeout_seconds: Type.Optional(
+    Type.Number({
+      exclusiveMinimum: 0,
+      description:
+        "Kill the child agent after this many seconds and return a failure with session_id. Default 1800 (30 minutes).",
+    }),
+  ),
 });
 
 export default function (pi: ExtensionAPI) {
@@ -804,12 +952,15 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "subagent",
+    exposure: "model-only",
     label: "Subagent",
     description: [
       "Delegate tasks to specialized subagents with isolated context.",
+      "Do not use this for search, file reads, grep, or aggregation; the parent handles those with codemode.",
       "Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
       `Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
-      `To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
+      `To enable project-local agents in ${hostConfigDirName()}/agents, set agentScope: "both" (or "project").`,
+      "Child sessions are persisted (not --no-session) and killed after timeout_seconds (default 1800).",
     ].join(" "),
     parameters: SubagentParams,
 
@@ -819,6 +970,11 @@ export default function (pi: ExtensionAPI) {
         model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
         thinkingLevel: ctx.thinkingLevel,
       };
+      const timeoutMs =
+        params.timeout_seconds === undefined
+          ? DEFAULT_SUBAGENT_TIMEOUT_MS
+          : Math.round(params.timeout_seconds * 1000);
+      const runOptions: RunSingleAgentOptions = { timeoutMs };
       const discovery = discoverAgents(ctx.cwd, agentScope);
       const agents = discovery.agents;
       const confirmProjectAgents = params.confirmProjectAgents ?? true;
@@ -913,6 +1069,7 @@ export default function (pi: ExtensionAPI) {
             signal,
             chainUpdate,
             makeDetails("chain"),
+            runOptions,
           );
           results.push(result);
 
@@ -1026,6 +1183,7 @@ export default function (pi: ExtensionAPI) {
                 }
               },
               makeDetails("parallel"),
+              runOptions,
             );
             allResults[index] = result;
             emitParallelUpdate();
@@ -1056,6 +1214,7 @@ export default function (pi: ExtensionAPI) {
           signal,
           onUpdate,
           makeDetails("single"),
+          runOptions,
         );
         const isError = isFailedResult(result);
         if (isError) {
@@ -1182,9 +1341,13 @@ export default function (pi: ExtensionAPI) {
       if (details.mode === "single" && details.results.length === 1) {
         const r = details.results[0];
         const isError = isFailedResult(r);
-        const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
-        const displayItems = getDisplayItems(r.messages);
-        const finalOutput = getFinalOutput(r.messages);
+        const icon = resultStatusIcon(r, theme.fg.bind(theme));
+        const displayItems = getProgressItems(r);
+        const finalOutput = r.running
+          ? result.content[0]?.type === "text"
+            ? result.content[0].text
+            : ""
+          : getFinalOutput(r.messages);
 
         if (expanded) {
           const container = new Container();
@@ -1217,7 +1380,7 @@ export default function (pi: ExtensionAPI) {
               container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
             }
           }
-          const usageStr = formatUsageStats(r.usage, r.model);
+          const usageStr = formatUsageStats(r.usage, r.model, r.thinkingLevel);
           if (usageStr) {
             container.addChild(new Spacer(1));
             container.addChild(new Text(theme.fg("dim", usageStr), 0, 0));
@@ -1228,13 +1391,20 @@ export default function (pi: ExtensionAPI) {
         let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
         if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
         if (isError && r.errorMessage) text += `\n${theme.fg("error", `Error: ${r.errorMessage}`)}`;
-        else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
+        else if (displayItems.length === 0 && !finalOutput)
+          text += `\n${theme.fg("muted", "(no output)")}`;
+        else if (displayItems.length === 0) text += `\n${theme.fg("toolOutput", finalOutput)}`;
         else {
           text += `\n${renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT)}`;
           if (displayItems.length > COLLAPSED_ITEM_COUNT)
             text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
         }
-        const usageStr = formatUsageStats(r.usage, r.model);
+        const usageStr = [
+          formatUsageStats(r.usage, r.model, r.thinkingLevel),
+          r.sessionId ? `session ${r.sessionId}` : "",
+        ]
+          .filter(Boolean)
+          .join(" ");
         if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
         return new Text(text, 0, 0);
       }
@@ -1316,7 +1486,7 @@ export default function (pi: ExtensionAPI) {
               container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
             }
 
-            const stepUsage = formatUsageStats(r.usage, r.model);
+            const stepUsage = formatUsageStats(r.usage, r.model, r.thinkingLevel);
             if (stepUsage) container.addChild(new Text(theme.fg("dim", stepUsage), 0, 0));
           }
 
@@ -1408,7 +1578,7 @@ export default function (pi: ExtensionAPI) {
               container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
             }
 
-            const taskUsage = formatUsageStats(r.usage, r.model);
+            const taskUsage = formatUsageStats(r.usage, r.model, r.thinkingLevel);
             if (taskUsage) container.addChild(new Text(theme.fg("dim", taskUsage), 0, 0));
           }
 

@@ -38,7 +38,7 @@ type UsageLike = {
   cost?: { total?: number };
 };
 
-export type UsageSampleKind = "assistant" | "tool" | "summary";
+export type UsageSampleKind = "assistant" | "tool" | "summary" | "usage";
 
 /** One provider request recorded in the session history. */
 export type UsageSample = {
@@ -187,11 +187,16 @@ export function collectUsageSamples(entries: readonly SessionEntry[]): UsageSamp
       continue;
     }
 
-    if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.usage) {
+    if (
+      (entry.type === "usage" || entry.type === "branch_summary" || entry.type === "compaction") &&
+      entry.usage
+    ) {
       const sample = sampleFromUsage({
         raw: entry.usage,
         timestamp: timestampValue(entry.timestamp),
-        kind: "summary",
+        kind: entry.type === "usage" ? "usage" : "summary",
+        provider: entry.type === "usage" ? entry.provider : undefined,
+        model: entry.type === "usage" ? entry.model : undefined,
       });
       if (sample) samples.push(sample);
     }
@@ -256,31 +261,25 @@ export function getCacheHitRate(
 }
 
 export function collectSessionUsage(entries: readonly SessionEntry[]): SessionUsage {
+  const metrics = collectUsageMetrics(entries);
   const usage: SessionUsage = {
     turns: 0,
     userMessages: 0,
     toolCalls: 0,
-    input: 0,
-    output: 0,
-    cacheRead: 0,
-    cacheWrite: 0,
-    total: 0,
-    cost: 0,
+    input: metrics.uncachedInput - metrics.cacheWrite,
+    output: metrics.output,
+    cacheRead: metrics.cacheRead,
+    cacheWrite: metrics.cacheWrite,
+    total: metrics.total,
+    cost: metrics.cost,
   };
 
   for (const entry of entries) {
-    if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.usage) {
-      addUsage(usage, entry.usage);
-    }
     if (entry.type !== "message") continue;
 
     const message = entry.message;
     if (message.role === "user") {
       usage.userMessages += 1;
-      continue;
-    }
-    if (message.role === "toolResult") {
-      if (message.usage) addUsage(usage, message.usage);
       continue;
     }
     if (message.role !== "assistant") continue;
@@ -289,10 +288,8 @@ export function collectSessionUsage(entries: readonly SessionEntry[]): SessionUs
     if (Array.isArray(message.content)) {
       usage.toolCalls += message.content.filter((block) => block.type === "toolCall").length;
     }
-    addUsage(usage, message.usage);
   }
 
-  usage.total = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
   return usage;
 }
 
@@ -310,34 +307,6 @@ function formatCount(count: number): string {
 
 function formatRate(rate: number | undefined): string {
   return rate === undefined ? "—" : `${rate.toFixed(1)}%`;
-}
-
-function sessionPromptTokens(usage: SessionUsage): number {
-  return usage.input + usage.cacheRead + usage.cacheWrite;
-}
-
-function sessionCacheRate(usage: SessionUsage): number | undefined {
-  const promptTokens = sessionPromptTokens(usage);
-  if (promptTokens <= 0) return undefined;
-  return (usage.cacheRead / promptTokens) * 100;
-}
-
-/** Compact rolling-window label for the always-visible input panel. */
-export function formatUsageWindowCompact(metrics: UsageMetrics, label = "1m"): string {
-  if (metrics.requests === 0) return `${label} —`;
-  return `${label} ${metrics.requests}r in${formatTokens(metrics.promptTokens)}/u${formatTokens(metrics.uncachedInput)} out${formatTokens(metrics.output)}`;
-}
-
-/** Full header label: rolling rate metrics plus long-term cache/session context. */
-export function formatUsageHeader(session: SessionUsage, recent: UsageMetrics): string {
-  const cache = sessionCacheRate(session);
-  return `${formatUsageWindowCompact(recent)} · cache${formatRate(cache)} · session${formatTokens(session.total)}`;
-}
-
-/** Narrow-terminal header label. */
-export function formatUsageHeaderCompact(session: SessionUsage, recent: UsageMetrics): string {
-  const cache = sessionCacheRate(session);
-  return `${formatUsageWindowCompact(recent)} · c${formatRate(cache)} · s${formatTokens(session.total)}`;
 }
 
 export function formatSessionUsage(usage: SessionUsage, label = "session"): string {
@@ -358,25 +327,6 @@ export function formatSessionUsage(usage: SessionUsage, label = "session"): stri
   if (usage.toolCalls > 0) parts.push(`${usage.toolCalls} tools`);
 
   return parts.join("  ");
-}
-
-/** The session total used by the always-visible metadata line. */
-export function formatSessionUsageTotal(usage: SessionUsage): string {
-  const turnLabel = `${usage.turns} turn${usage.turns === 1 ? "" : "s"}`;
-  return `session ${formatTokens(usage.total)} tok · ${turnLabel}`;
-}
-
-/** Compact form for persistent UI such as the input-panel metadata line. */
-export function formatSessionUsageCompact(usage: SessionUsage): string {
-  const parts = [formatSessionUsageTotal(usage)];
-  const tokenParts = [];
-  if (usage.input) tokenParts.push(`↑${formatTokens(usage.input)}`);
-  if (usage.output) tokenParts.push(`↓${formatTokens(usage.output)}`);
-  if (usage.cacheRead) tokenParts.push(`R${formatTokens(usage.cacheRead)}`);
-  if (usage.cacheWrite) tokenParts.push(`W${formatTokens(usage.cacheWrite)}`);
-  if (tokenParts.length > 0) parts.push(tokenParts.join(" "));
-  if (usage.cost > 0) parts.push(`$${usage.cost.toFixed(3)}`);
-  return parts.join(" ");
 }
 
 export function hasSessionUsage(usage: SessionUsage): boolean {
@@ -403,15 +353,6 @@ function readSessionEntries(path: string): SessionEntry[] {
     }
   }
   return entries;
-}
-
-function addUsage(usage: SessionUsage, raw: UsageLike | undefined): void {
-  if (!raw) return;
-  usage.input += numberValue(raw.input);
-  usage.output += numberValue(raw.output);
-  usage.cacheRead += numberValue(raw.cacheRead);
-  usage.cacheWrite += numberValue(raw.cacheWrite);
-  usage.cost += numberValue(raw.cost?.total);
 }
 
 function formatMetricsLines(metrics: UsageMetrics): string[] {
